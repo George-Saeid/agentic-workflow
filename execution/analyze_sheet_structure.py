@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from collections import Counter
+from datetime import datetime, timedelta
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -18,6 +19,25 @@ from googleapiclient.errors import HttpError
 
 # Scopes for Google Sheets API (read-only)
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets.readonly']
+
+# Google Sheets epoch (December 30, 1899)
+SHEETS_EPOCH = datetime(1899, 12, 30)
+
+def serial_to_date(serial_number: float) -> str:
+    """
+    Convert Google Sheets serial number to date string.
+    
+    Args:
+        serial_number: The numeric date value from Google Sheets
+        
+    Returns:
+        Date string in YYYY-MM-DD format
+    """
+    try:
+        date = SHEETS_EPOCH + timedelta(days=serial_number)
+        return date.strftime('%Y-%m-%d')
+    except (ValueError, OverflowError):
+        return str(serial_number)
 
 def extract_spreadsheet_id(url_or_id: str) -> str:
     """
@@ -421,7 +441,7 @@ def analyze_column_types(grid_data: List[Dict], start_row: int = 1) -> Dict[int,
     
     return column_analysis
 
-def analyze_sheet(service, spreadsheet_id: str, sheet_name: str, sheet_id: int) -> Dict:
+def analyze_sheet(service, spreadsheet_id: str, sheet_name: str, sheet_id: int, max_rows: int = 5000) -> Dict:
     """
     Analyze structure of a single sheet.
     
@@ -430,15 +450,39 @@ def analyze_sheet(service, spreadsheet_id: str, sheet_name: str, sheet_id: int) 
         spreadsheet_id: ID of the spreadsheet
         sheet_name: Name of the sheet to analyze
         sheet_id: ID of the sheet
+        max_rows: Maximum number of rows to fetch (default 5000)
         
     Returns:
         Dictionary with sheet analysis
     """
     try:
+        # First, get sheet properties to check dimensions
+        metadata = service.spreadsheets().get(
+            spreadsheetId=spreadsheet_id,
+            ranges=[sheet_name],
+            includeGridData=False
+        ).execute()
+        
+        sheets = metadata.get('sheets', [])
+        if sheets:
+            properties = sheets[0].get('properties', {})
+            grid_props = properties.get('gridProperties', {})
+            actual_rows = grid_props.get('rowCount', 0)
+            actual_cols = grid_props.get('columnCount', 0)
+            
+            # If sheet is very large, limit the range
+            if actual_rows > max_rows:
+                print(f"  ⚠ Sheet has {actual_rows} rows, limiting to {max_rows} rows", file=sys.stderr)
+                range_notation = f"'{sheet_name}'!A1:ZZZ{max_rows}"
+            else:
+                range_notation = sheet_name
+        else:
+            range_notation = sheet_name
+        
         # Fetch sheet data with full cell metadata
         result = service.spreadsheets().get(
             spreadsheetId=spreadsheet_id,
-            ranges=[sheet_name],
+            ranges=[range_notation],
             includeGridData=True
         ).execute()
         
@@ -475,12 +519,29 @@ def analyze_sheet(service, spreadsheet_id: str, sheet_name: str, sheet_id: int) 
         column_headers = []
         if row_data and 'values' in row_data[0]:
             for cell in row_data[0]['values']:
-                if 'effectiveValue' in cell:
+                # First try formattedValue (what the user sees)
+                if 'formattedValue' in cell:
+                    column_headers.append(cell['formattedValue'])
+                elif 'effectiveValue' in cell:
                     effective = cell['effectiveValue']
                     if 'stringValue' in effective:
                         column_headers.append(effective['stringValue'])
                     elif 'numberValue' in effective:
-                        column_headers.append(str(effective['numberValue']))
+                        num_val = effective['numberValue']
+                        # Check if this might be a date (reasonable date range)
+                        # Google Sheets dates: 1 = 1899-12-31, 44927 = 2023-01-01, etc.
+                        if 1 < num_val < 100000 and 'effectiveFormat' in cell:
+                            # Check if cell has date formatting
+                            number_format = cell.get('effectiveFormat', {}).get('numberFormat', {})
+                            format_type = number_format.get('type', '')
+                            if format_type == 'DATE' or format_type == 'DATE_TIME':
+                                column_headers.append(serial_to_date(num_val))
+                            else:
+                                column_headers.append(str(num_val))
+                        else:
+                            column_headers.append(str(num_val))
+                    elif 'boolValue' in effective:
+                        column_headers.append(str(effective['boolValue']))
                     else:
                         column_headers.append('')
                 else:
@@ -491,12 +552,25 @@ def analyze_sheet(service, spreadsheet_id: str, sheet_name: str, sheet_id: int) 
         for row in row_data[:10]:  # First 10 rows only
             if 'values' in row and len(row['values']) > 0:
                 cell = row['values'][0]
-                if 'effectiveValue' in cell:
+                # First try formattedValue (what the user sees)
+                if 'formattedValue' in cell:
+                    row_headers.append(cell['formattedValue'])
+                elif 'effectiveValue' in cell:
                     effective = cell['effectiveValue']
                     if 'stringValue' in effective:
                         row_headers.append(effective['stringValue'])
                     elif 'numberValue' in effective:
-                        row_headers.append(str(effective['numberValue']))
+                        num_val = effective['numberValue']
+                        # Check if this might be a date
+                        if 1 < num_val < 100000 and 'effectiveFormat' in cell:
+                            number_format = cell.get('effectiveFormat', {}).get('numberFormat', {})
+                            format_type = number_format.get('type', '')
+                            if format_type == 'DATE' or format_type == 'DATE_TIME':
+                                row_headers.append(serial_to_date(num_val))
+                            else:
+                                row_headers.append(str(num_val))
+                        else:
+                            row_headers.append(str(num_val))
                     else:
                         row_headers.append('')
                 else:
@@ -567,8 +641,18 @@ def analyze_spreadsheet(url_or_id: str) -> Dict:
         sheet_analyses = []
         for sheet_name, sheet_id in sheet_info:
             print(f"Analyzing sheet: {sheet_name}...", file=sys.stderr)
-            analysis = analyze_sheet(service, spreadsheet_id, sheet_name, sheet_id)
-            sheet_analyses.append(analysis)
+            try:
+                analysis = analyze_sheet(service, spreadsheet_id, sheet_name, sheet_id)
+                sheet_analyses.append(analysis)
+            except Exception as e:
+                print(f"  ⚠ Error analyzing sheet '{sheet_name}': {str(e)}", file=sys.stderr)
+                # Add error entry for this sheet
+                sheet_analyses.append({
+                    'sheet_name': sheet_name,
+                    'sheet_id': sheet_id,
+                    'error': str(e),
+                    'status': 'error'
+                })
         
         # Extract sheet names for summary
         sheet_names = [name for name, _ in sheet_info]
